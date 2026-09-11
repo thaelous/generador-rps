@@ -1,5 +1,0 @@
-streamlit
-requests
-openpyxl
-pymupdf
-pillow
