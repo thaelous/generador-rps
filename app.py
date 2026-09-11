@@ -3,7 +3,6 @@ import os
 import re
 import json
 import time
-import base64
 import requests
 import openpyxl
 from openpyxl.drawing.image import Image as OpenpyxlImage
@@ -25,16 +24,16 @@ uploaded_oc = st.file_uploader("2. Orden de Compra en PDF (OC)", type=["pdf"])
 uploaded_fotos = st.file_uploader("3. Fotos de Evidencia ('DESPUÉS' - hasta 3 imágenes)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
 SYSTEM_PROMPT = """
-Eres un auditor contable corporativo. Se te proporcionan dos documentos:
-1. Factura (CFDI en PDF).
-2. Orden de Compra (OC en PDF).
+Eres un auditor contable corporativo. Se te proporciona el texto extraído de:
+1. Factura emitida (CFDI).
+2. Orden de Compra oficial (OC).
 
 Tu tarea:
-1. Extraer los datos fiscales del CFDI y los generales de la OC para el formato RPS.
-2. Identificar la página específica de la Orden de Compra (número de página base 1) donde aparece la partida o tabla de partidas facturadas.
+1. Extraer los datos fiscales del CFDI y los generales de la OC para el formato RPS corporativo.
+2. Identificar la página específica de la Orden de Compra (número entero base 1) donde aparece la partida o tabla de partidas facturadas.
 3. Extraer todas las líneas facturadas. Si hay más de un concepto o partida, extraer cada uno en el arreglo 'lineas'. Para cada línea, identificar su número de línea en la OC y formatearlo estrictamente como 'X-1' (por ejemplo: '1-1', '2-1', '3-1').
 
-Devuelve EXCLUSIVAMENTE un objeto JSON con la siguiente estructura:
+Devuelve EXCLUSIVAMENTE un objeto JSON con la siguiente estructura exacta:
 {
   "orden_compra": string,
   "nombre_proveedor": string,
@@ -59,30 +58,32 @@ Reglas estrictas:
 - 'pagina_oc_partida': número entero de la página del PDF de la OC donde está el renglón/partida facturada (ej. 4).
 - 'lineas.linea_po': código en formato 'X-1' correspondiente a esa partida en la OC.
 - 'lineas.descripcion': sólo el concepto del servicio, eliminando solicitante y número de OC/PO.
-- Devuelve únicamente el JSON válido.
+- Devuelve únicamente el JSON válido sin bloques markdown ni texto adicional.
 """
+
+def extraer_texto_pdf(pdf_bytes):
+    """Extrae el texto de cada página indicando su número para aligerar la petición a la IA."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    texto_total = []
+    for num, page in enumerate(doc, 1):
+        texto_total.append(f"--- PÁGINA {num} ---\n{page.get_text()}")
+    return "\n".join(texto_total)
 
 def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
     clean_key = raw_key.strip().strip("'").strip('"')
-    fac_b64 = base64.b64encode(factura_bytes).decode('utf-8')
     
-    parts = [
-        {"inline_data": {"mime_type": "application/pdf", "data": fac_b64}},
-        {"text": "Factura emitida (CFDI)."}
-    ]
+    texto_fac = extraer_texto_pdf(factura_bytes)
+    prompt_usuario = f"=== DOCUMENTO 1: FACTURA (CFDI) ===\n{texto_fac}\n\n"
     
     if oc_bytes:
-        oc_b64 = base64.b64encode(oc_bytes).decode('utf-8')
-        parts.extend([
-            {"inline_data": {"mime_type": "application/pdf", "data": oc_b64}},
-            {"text": "Orden de Compra oficial (OC). Cruza las partidas facturadas con las líneas de la OC, extrae cada partida con su línea 'X-1' e indica en 'pagina_oc_partida' la página exacta donde se visualiza el renglón."}
-        ])
+        texto_oc = extraer_texto_pdf(oc_bytes)
+        prompt_usuario += f"=== DOCUMENTO 2: ORDEN DE COMPRA (OC) ===\n{texto_oc}\n\nCruza las partidas y especifica en 'pagina_oc_partida' en qué número de página de la OC está el renglón facturado."
     else:
-        parts.append({"text": "Extrae los datos únicamente de la factura."})
+        prompt_usuario += "No se adjuntó OC. Extrae únicamente los datos de la factura."
 
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"parts": parts}],
+        "contents": [{"parts": [{"text": prompt_usuario}]}],
         "generationConfig": {
             "response_mime_type": "application/json",
             "temperature": 0.1
@@ -94,10 +95,11 @@ def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
         "x-goog-api-key": clean_key
     }
     
+    # Modelos oficiales válidos con cuota amplia
     modelos = [
-        "gemini-2.5-flash-lite",
         "gemini-2.5-flash",
-        "gemini-3.6-flash"
+        "gemini-2.5-flash-lite",
+        "gemini-1.5-flash"
     ]
     ultimo_error = None
     
@@ -105,21 +107,21 @@ def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent".strip()
         for intento in range(3):
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=75)
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
                 if response.status_code == 200:
                     data = response.json()
                     texto = data["candidates"][0]["content"]["parts"][0]["text"]
                     return json.loads(texto)
                 elif response.status_code in (429, 503):
-                    ultimo_error = f"Código {response.status_code}: Servidor ocupado ({mod}). Reintentando..."
-                    time.sleep(2 * (intento + 1))
+                    ultimo_error = f"Código {response.status_code}: Cuota saturada temporalmente en {mod}. Esperando..."
+                    time.sleep(4 * (intento + 1))
                     continue
                 else:
                     ultimo_error = f"Código {response.status_code}: {response.text}"
                     break
             except Exception as e:
                 ultimo_error = str(e)
-                time.sleep(2)
+                time.sleep(3)
                 
     raise RuntimeError(ultimo_error)
 
@@ -170,18 +172,13 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
     solicitante_val = datos.get("solicitante", "")
     ws.title = folio
     
-    # 1. Orden de Compra (Fila 7, Columna E)
     if oc_val:
         ws.cell(row=7, column=5, value=int(oc_val) if str(oc_val).isdigit() else str(oc_val))
     
-    # 2. Proveedor (Fila 9, Columna E)
     ws.cell(row=9, column=5, value=datos.get("nombre_proveedor", ""))
-    
-    # 3. Folio Factura y Tipo de Servicio (Fila 11)
     ws.cell(row=11, column=5, value=int(folio) if folio.isdigit() else str(folio))
     ws.cell(row=11, column=10, value=datos.get("tipo_servicio", "Entrenamiento"))
     
-    # 4. Detalle de partidas/conceptos
     lineas = datos.get("lineas", [])
     fila_inicio = 15
     for idx, l in enumerate(lineas):
@@ -205,19 +202,16 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         ws.cell(row=r, column=7, value=desc_limpia)
         ws.cell(row=r, column=16, value="YES")
         
-    # 5. Monto Total (Fila 25)
     subtotal = datos.get("subtotal", 0)
     ws.cell(row=25, column=5, value=subtotal)
     ws.cell(row=25, column=6, value=subtotal)
     
-    # 6. Solicitante (Fila 27)
     if solicitante_val:
         ws.cell(row=27, column=3, value=solicitante_val)
         
-    # Limpiar imágenes previas para no encimar
     ws._images.clear()
 
-    # 7. ANTES: Cuadrado perfecto en T10 (430px x 570px)
+    # ANTES: Coordenadas y dimensiones calibradas
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
@@ -229,7 +223,7 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         except Exception:
             pass
             
-    # 8. DESPUÉS: Centradas en AD10, AD17, AD24 con proporciones originales
+    # DESPUÉS: Coordenadas y dimensiones proporcionales
     celdas_despues = ["AD10", "AD17", "AD24"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
@@ -266,7 +260,7 @@ if "procesado" not in st.session_state:
 
 if uploaded_factura and api_key:
     if st.button("Procesar Factura y Generar RPS"):
-        with st.spinner("Analizando documentos y ensamblando RPS en Excel..."):
+        with st.spinner("Analizando documentos con IA y ensamblando RPS en Excel..."):
             try:
                 oc_bytes = uploaded_oc.getvalue() if uploaded_oc else None
                 fotos_bytes = [f.getvalue() for f in uploaded_fotos] if uploaded_fotos else []
