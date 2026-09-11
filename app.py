@@ -75,7 +75,6 @@ def extraer_datos(pdf_bytes, raw_key):
       "x-goog-api-key": clean_key,
   }
 
-  # Modelos activos recomendados por la API
   modelos = [
       "gemini-3.6-flash",
       "gemini-3.1-pro-preview",
@@ -125,9 +124,20 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
   lineas = datos.get("lineas", [])
   if lineas:
     l = lineas[0]
-    ws.cell(row=15, column=1, value=l.get("linea_po", "3-1"))
+
+    # Dejar vacío # de línea en PO
+    ws.cell(row=15, column=1, value="")
+
     ws.cell(row=15, column=2, value=l.get("cantidad", 1))
-    ws.cell(row=15, column=4, value=l.get("unidad", "LOT"))
+
+    # Limpiar E48 si viene en la unidad
+    unidad = str(l.get("unidad", "LOT")).strip()
+    if "E48" in unidad.upper() or not unidad:
+      unidad = "LOT"
+    else:
+      unidad = unidad.replace("E48", "").replace("-", "").strip()
+    ws.cell(row=15, column=4, value=unidad)
+
     ws.cell(row=15, column=5, value=l.get("monto", datos.get("subtotal", 0)))
     ws.cell(row=15, column=6, value=datos.get("moneda", "MXN"))
     ws.cell(row=15, column=7, value=l.get("descripcion", ""))
