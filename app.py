@@ -6,20 +6,25 @@ import time
 import base64
 import requests
 import openpyxl
+from openpyxl.drawing.image import Image as OpenpyxlImage
+from PIL import Image as PILImage
+import fitz  # PyMuPDF
 import streamlit as st
 
 st.set_page_config(page_title="Generador RPS AAM", page_icon="📄", layout="centered")
-st.title("Generador Automático de RPS")
-st.write("Sube la factura en PDF para obtener el Excel idéntico y prellenado con logos y formato oficial.")
+st.title("Generador Automático de RPS con Evidencias")
+st.write("Sube la Factura, la Orden de Compra (OC) y tus fotos de evidencia para generar el RPS completo.")
 
 api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
 if not api_key:
     api_key = st.text_input("Ingresa tu Gemini API Key:", type="password")
 
-uploaded_pdf = st.file_uploader("Selecciona la Factura en PDF (CFDI)", type=["pdf"])
+# Insumos
+uploaded_factura = st.file_uploader("1. Factura en PDF (CFDI)", type=["pdf"])
+uploaded_oc = st.file_uploader("2. Orden de Compra en PDF (OC)", type=["pdf"])
+uploaded_fotos = st.file_uploader("3. Fotos de Evidencia ('DESPUÉS' - hasta 3 imágenes)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
-# Campo manual para el número de línea en PO
 linea_po_manual = st.text_input(
     "Número de línea en PO (opcional):", 
     placeholder="Ej. 3-1 o déjalo vacío si no aplica"
@@ -106,25 +111,43 @@ def extraer_datos(pdf_bytes, raw_key):
 
 def limpiar_descripcion(desc, solicitante, oc):
     texto = desc
-    
     if solicitante and solicitante.strip():
         patron_sol = re.compile(re.escape(solicitante.strip()), re.IGNORECASE)
         texto = patron_sol.sub("", texto)
-        
     texto = re.sub(r'(?i)(solicita(?:nte)?|atenci[oó]n|contacto)\s*[:\-]?\s*', '', texto)
-    
     if oc and str(oc).strip():
         patron_oc = re.compile(rf'(?i)(?:oc|orden\s*(?:de)?\s*compra|po)\s*[:#\-]?\s*{re.escape(str(oc).strip())}')
         texto = patron_oc.sub("", texto)
         texto = re.sub(rf'\b{re.escape(str(oc).strip())}\b', '', texto)
-        
     texto = re.sub(r'(?i)\b(?:oc|po)\s*[:#\-]?\b', '', texto)
     texto = re.sub(r'\s+', ' ', texto)
     texto = re.sub(r'^[\s,\.\-_/]+|[\s,\.\-_/]+$', '', texto)
-    
     return texto.strip()
 
-def llenar_plantilla(datos, linea_po_usuario="", plantilla_path="plantilla_RPS.xlsx"):
+def extraer_pagina_partidas_oc(oc_bytes):
+    """Busca la página de la OC con partidas y la convierte en imagen"""
+    doc = fitz.open(stream=oc_bytes, filetype="pdf")
+    target_page_idx = 0
+    
+    # Buscar la página que contenga las partidas/líneas
+    for i, page in enumerate(doc):
+        texto = page.get_text()
+        if "Partida/Descripción" in texto or "Precio ampliado" in texto or "Precio unitario" in texto:
+            target_page_idx = i
+            break
+            
+    page = doc[target_page_idx]
+    pix = page.get_pixmap(dpi=150)
+    img = PILImage.open(io.BytesIO(pix.tobytes("png")))
+    
+    # Redimensionar para que calce bien en el marco "ANTES"
+    img.thumbnail((380, 520), PILImage.Resampling.LANCZOS)
+    img_byte_arr = io.BytesIO()
+    img.save(img_byte_arr, format='PNG')
+    img_byte_arr.seek(0)
+    return img_byte_arr
+
+def llenar_plantilla(datos, linea_po_usuario="", oc_bytes=None, fotos_bytes=[], plantilla_path="plantilla_RPS.xlsx"):
     wb = openpyxl.load_workbook(plantilla_path)
     ws = wb["3151"] if "3151" in wb.sheetnames else wb.active
     
@@ -140,7 +163,7 @@ def llenar_plantilla(datos, linea_po_usuario="", plantilla_path="plantilla_RPS.x
     # 2. Proveedor (Fila 9, Columna E)
     ws.cell(row=9, column=5, value=datos.get("nombre_proveedor", ""))
     
-    # 3. Folio Factura (Fila 11, Columna E) y Tipo de Servicio (Fila 11, Columna J)
+    # 3. Folio Factura y Tipo de Servicio
     ws.cell(row=11, column=5, value=int(folio) if folio.isdigit() else str(folio))
     ws.cell(row=11, column=10, value=datos.get("tipo_servicio", "Entrenamiento"))
     
@@ -148,14 +171,9 @@ def llenar_plantilla(datos, linea_po_usuario="", plantilla_path="plantilla_RPS.x
     lineas = datos.get("lineas", [])
     if lineas:
         l = lineas[0]
-        
-        # Valor manual ingresado por el usuario en pantalla (o vacío si no puso nada)
         ws.cell(row=15, column=1, value=linea_po_usuario.strip() if linea_po_usuario else "")
-        
-        # Cantidad
         ws.cell(row=15, column=2, value=l.get("cantidad", 1))
         
-        # Unidad limpia sin E48
         unidad = str(l.get("unidad", "LOT")).strip()
         if "E48" in unidad.upper() or not unidad:
             unidad = "LOT"
@@ -163,39 +181,72 @@ def llenar_plantilla(datos, linea_po_usuario="", plantilla_path="plantilla_RPS.x
             unidad = unidad.replace("E48", "").replace("-", "").strip()
         ws.cell(row=15, column=4, value=unidad)
         
-        # Monto y Moneda
         ws.cell(row=15, column=5, value=l.get("monto", datos.get("subtotal", 0)))
         ws.cell(row=15, column=6, value=datos.get("moneda", "MXN"))
         
-        # Descripción limpia sin solicitante ni OC
         desc_original = l.get("descripcion", "")
         desc_limpia = limpiar_descripcion(desc_original, solicitante_val, oc_val)
         ws.cell(row=15, column=7, value=desc_limpia)
-        
         ws.cell(row=15, column=16, value="YES")
         
-    # 5. Monto Total a Recibir (Fila 25, Columnas E y F)
+    # 5. Monto Total a Recibir (Fila 25)
     subtotal = datos.get("subtotal", 0)
     ws.cell(row=25, column=5, value=subtotal)
     ws.cell(row=25, column=6, value=subtotal)
     
-    # 6. Solicitante (Fila 27, Columna C)
+    # 6. Solicitante (Fila 27)
     if solicitante_val:
         ws.cell(row=27, column=3, value=solicitante_val)
+        
+    # Limpiar imágenes existentes en la plantilla para no duplicar
+    ws._images.clear()
+
+    # 7. Insertar Imagen de Orden de Compra ("ANTES") en S8
+    if oc_bytes:
+        try:
+            img_oc_bytes = extraer_pagina_partidas_oc(oc_bytes)
+            img_oc = OpenpyxlImage(img_oc_bytes)
+            ws.add_image(img_oc, "S8")
+        except Exception as e:
+            st.warning(f"No se pudo insertar la imagen de la OC: {e}")
+            
+    # 8. Insertar Fotos de Evidencia ("DESPUÉS") en AC8, AC15, AC22
+    celdas_despues = ["AC8", "AC15", "AC22"]
+    for i, f_bytes in enumerate(fotos_bytes[:3]):
+        try:
+            p_img = PILImage.open(io.BytesIO(f_bytes))
+            p_img.thumbnail((320, 150), PILImage.Resampling.LANCZOS)
+            b_arr = io.BytesIO()
+            p_img.save(b_arr, format='PNG')
+            b_arr.seek(0)
+            
+            excel_img = OpenpyxlImage(b_arr)
+            ws.add_image(excel_img, celdas_despues[i])
+        except Exception as e:
+            st.warning(f"No se pudo insertar la foto {i+1}: {e}")
         
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return output, folio, (oc_val if oc_val else "RPS")
 
-if uploaded_pdf and api_key:
+if uploaded_factura and api_key:
     if st.button("Procesar Factura y Generar RPS"):
-        with st.spinner("Leyendo factura con Gemini y llenando formato..."):
+        with st.spinner("Procesando documentos e integrando imágenes..."):
             try:
-                datos = extraer_datos(uploaded_pdf.getvalue(), api_key)
-                excel_salida, folio, oc = llenar_plantilla(datos, linea_po_manual)
+                datos = extraer_datos(uploaded_factura.getvalue(), api_key)
                 
-                st.success("¡RPS generado exitosamente!")
+                oc_bytes = uploaded_oc.getvalue() if uploaded_oc else None
+                fotos_bytes = [f.getvalue() for f in uploaded_fotos] if uploaded_fotos else []
+                
+                excel_salida, folio, oc = llenar_plantilla(
+                    datos, 
+                    linea_po_usuario=linea_po_manual,
+                    oc_bytes=oc_bytes,
+                    fotos_bytes=fotos_bytes
+                )
+                
+                st.success("¡RPS con evidencias generado exitosamente!")
                 
                 with st.expander("Ver datos extraídos"):
                     st.json(datos)
