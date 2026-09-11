@@ -159,7 +159,8 @@ def extraer_pagina_completa_oc(oc_bytes, pagina_sugerida=None):
     page = doc[target_idx]
     pix = page.get_pixmap(dpi=150)
     img = PILImage.open(io.BytesIO(pix.tobytes("png")))
-    img.thumbnail((390, 520), PILImage.Resampling.LANCZOS)
+    # Dimensiones ajustadas al marco izquierdo completo de Excel
+    img.thumbnail((470, 560), PILImage.Resampling.LANCZOS)
     
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='PNG')
@@ -214,20 +215,22 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         
     ws._images.clear()
 
+    # 1. Ajuste de imagen ANTES: inicia en R7 para centrar en el recuadro izquierdo
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
             img_oc_bytes = extraer_pagina_completa_oc(oc_bytes, pag_oc)
             img_oc = OpenpyxlImage(img_oc_bytes)
-            ws.add_image(img_oc, "S8")
+            ws.add_image(img_oc, "R7")
         except Exception:
             pass
             
-    celdas_despues = ["AC8", "AC14", "AC20"]
+    # 2. Ajuste de imagen DESPUÉS: inicia en AD7, AD14, AD21 para centrarse dentro del recuadro derecho
+    celdas_despues = ["AD7", "AD14", "AD21"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
             p_img = PILImage.open(io.BytesIO(f_bytes))
-            p_img.thumbnail((320, 130), PILImage.Resampling.LANCZOS)
+            p_img.thumbnail((440, 160), PILImage.Resampling.LANCZOS)
             b_arr = io.BytesIO()
             p_img.save(b_arr, format='PNG')
             b_arr.seek(0)
@@ -359,7 +362,6 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
     p.rect(40, y_box, w_box, h_box, fill=0, stroke=1)
     p.rect(320, y_box, w_box, h_box, fill=0, stroke=1)
     
-    # Pegar Hoja Completa de la OC
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
@@ -373,7 +375,6 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
         except Exception:
             pass
             
-    # Pegar Fotos de Evidencia bien distribuidas dentro del recuadro derecho
     if fotos_bytes:
         n_fotos = min(len(fotos_bytes), 3)
         margen = 8
@@ -405,6 +406,15 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
     buffer.seek(0)
     return buffer
 
+# ----------------- GESTIÓN DE SESIÓN Y STREAMLIT -----------------
+# Inicializar variables en session_state para que no se borren al descargar un archivo
+if "procesado" not in st.session_state:
+    st.session_state.procesado = False
+    st.session_state.excel_salida = None
+    st.session_state.pdf_salida = None
+    st.session_state.nombre_base = ""
+    st.session_state.datos = None
+
 if uploaded_factura and api_key:
     if st.button("Procesar y Generar Documentos"):
         with st.spinner("Analizando documentos con IA y ensamblando archivos..."):
@@ -426,29 +436,41 @@ if uploaded_factura and api_key:
                     fotos_bytes=fotos_bytes
                 )
                 
-                total_lineas = len(datos.get("lineas", []))
-                st.success(f"¡RPS generado con éxito! ({total_lineas} partida(s) detectada(s))")
-                
-                with st.expander("Ver detalle de datos extraídos"):
-                    st.json(datos)
-                
                 folio = str(datos.get("folio_factura", "RPS"))
                 oc = str(datos.get("orden_compra", "OC"))
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button(
-                        label=f"📊 Descargar RPS {oc} {folio}.xlsx",
-                        data=excel_salida,
-                        file_name=f"RPS {oc} {folio}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                with col2:
-                    st.download_button(
-                        label=f"📄 Descargar RPS {oc} {folio}.pdf",
-                        data=pdf_salida,
-                        file_name=f"RPS {oc} {folio}.pdf",
-                        mime="application/pdf"
-                    )
+                # Guardar en memoria de sesión persistente
+                st.session_state.procesado = True
+                st.session_state.excel_salida = excel_salida.getvalue()
+                st.session_state.pdf_salida = pdf_salida.getvalue()
+                st.session_state.nombre_base = f"RPS {oc} {folio}"
+                st.session_state.datos = datos
+                
             except Exception as e:
                 st.error(f"Error al procesar: {e}")
+
+# Si ya fue procesado, mostrar siempre los dos botones de descarga
+if st.session_state.procesado:
+    total_lineas = len(st.session_state.datos.get("lineas", []))
+    st.success(f"¡Documentos listos! ({total_lineas} partida(s) procesada(s))")
+    
+    with st.expander("Ver detalle de datos extraídos"):
+        st.json(st.session_state.datos)
+        
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            label=f"📊 Descargar {st.session_state.nombre_base}.xlsx",
+            data=st.session_state.excel_salida,
+            file_name=f"{st.session_state.nombre_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="btn_dl_excel"
+        )
+    with col2:
+        st.download_button(
+            label=f"📄 Descargar {st.session_state.nombre_base}.pdf",
+            data=st.session_state.pdf_salida,
+            file_name=f"{st.session_state.nombre_base}.pdf",
+            mime="application/pdf",
+            key="btn_dl_pdf"
+        )
