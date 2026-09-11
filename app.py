@@ -3,12 +3,13 @@ import os
 import re
 import json
 import time
-import requests
 import openpyxl
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from PIL import Image as PILImage
 import fitz  # PyMuPDF
 import streamlit as st
+from google import genai
+from google.genai import types
 
 st.set_page_config(page_title="Generador RPS AAM", page_icon="📊", layout="centered")
 st.title("Generador Automático de RPS con Auditoría")
@@ -74,6 +75,7 @@ def extraer_texto_pdf(pdf_bytes):
 
 def auditar_y_extraer(factura_bytes, oc_bytes, raw_key):
     clean_key = raw_key.strip().strip("'").strip('"')
+    client = genai.Client(api_key=clean_key)
     
     texto_fac = extraer_texto_pdf(factura_bytes)
     prompt_usuario = f"=== DOCUMENTO 1: FACTURA (CFDI) ===\n{texto_fac}\n\n"
@@ -87,47 +89,32 @@ def auditar_y_extraer(factura_bytes, oc_bytes, raw_key):
     else:
         prompt_usuario += "No se adjuntó OC. Extrae únicamente los datos de la factura con 'documentos_coinciden': true."
 
-    payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-        "contents": [{"parts": [{"text": prompt_usuario}]}],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "temperature": 0.1
-        }
-    }
-    
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": clean_key
-    }
-    
-    modelos = [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-1.5-flash"
-    ]
+    # Intentos de ejecución con el SDK oficial
+    modelos = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
     ultimo_error = None
-    
+
     for mod in modelos:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent".strip()
         for intento in range(3):
             try:
-                response = requests.post(url, headers=headers, json=payload, timeout=60)
-                if response.status_code == 200:
-                    data = response.json()
-                    texto = data["candidates"][0]["content"]["parts"][0]["text"]
-                    return json.loads(texto)
-                elif response.status_code in (429, 503):
-                    ultimo_error = f"Código {response.status_code}: Esperando cupo de servicio ({mod})..."
-                    time.sleep(3 * (intento + 1))
+                response = client.models.generate_content(
+                    model=mod,
+                    contents=prompt_usuario,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        response_mime_type="application/json",
+                        temperature=0.1
+                    )
+                )
+                return json.loads(response.text)
+            except Exception as e:
+                err_str = str(e)
+                ultimo_error = err_str
+                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                    time.sleep(4 * (intento + 1))
                     continue
                 else:
-                    ultimo_error = f"Código {response.status_code}: {response.text}"
                     break
-            except Exception as e:
-                ultimo_error = str(e)
-                time.sleep(2)
-                
+
     raise RuntimeError(ultimo_error)
 
 def limpiar_descripcion(desc, solicitante, oc):
@@ -216,6 +203,7 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         
     ws._images.clear()
 
+    # ANTES: Calibrado en T10
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
@@ -227,6 +215,7 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         except Exception:
             pass
             
+    # DESPUÉS: Calibrado en AD10, AD17, AD24
     celdas_despues = ["AD10", "AD17", "AD24"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
@@ -270,7 +259,6 @@ if uploaded_factura and api_key:
                 
                 datos = auditar_y_extraer(uploaded_factura.getvalue(), oc_bytes, api_key)
                 
-                # VALIDACIÓN DEL AUDITOR
                 if not datos.get("documentos_coinciden", True):
                     st.session_state.procesado = False
                     motivo = datos.get("motivo_discrepancia", "Los documentos no corresponden entre sí.")
