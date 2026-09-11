@@ -3,3 +3,4 @@ requests
 openpyxl
 pymupdf
 pillow
+reportlab
