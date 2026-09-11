@@ -159,8 +159,8 @@ def extraer_pagina_completa_oc(oc_bytes, pagina_sugerida=None):
     page = doc[target_idx]
     pix = page.get_pixmap(dpi=150)
     img = PILImage.open(io.BytesIO(pix.tobytes("png")))
-    # Dimensiones ajustadas al marco izquierdo completo de Excel
-    img.thumbnail((470, 560), PILImage.Resampling.LANCZOS)
+    # Medidas calibradas al marco de OC en la plantilla
+    img.thumbnail((375, 490), PILImage.Resampling.LANCZOS)
     
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='PNG')
@@ -215,22 +215,23 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         
     ws._images.clear()
 
-    # 1. Ajuste de imagen ANTES: inicia en R7 para centrar en el recuadro izquierdo
+    # 1. ANTES: Colocada en S7 para quedar perfectamente centrada en el recuadro izquierdo
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
             img_oc_bytes = extraer_pagina_completa_oc(oc_bytes, pag_oc)
             img_oc = OpenpyxlImage(img_oc_bytes)
-            ws.add_image(img_oc, "R7")
+            ws.add_image(img_oc, "S7")
         except Exception:
             pass
             
-    # 2. Ajuste de imagen DESPUÉS: inicia en AD7, AD14, AD21 para centrarse dentro del recuadro derecho
-    celdas_despues = ["AD7", "AD14", "AD21"]
+    # 2. DESPUÉS: Centradas exactamente en AE (entre AD y AG) como en tu foto 2
+    celdas_despues = ["AE7", "AE14", "AE21"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
             p_img = PILImage.open(io.BytesIO(f_bytes))
-            p_img.thumbnail((440, 160), PILImage.Resampling.LANCZOS)
+            # Proporción vertical tipo retrato según tu foto de referencia
+            p_img.thumbnail((170, 185), PILImage.Resampling.LANCZOS)
             b_arr = io.BytesIO()
             p_img.save(b_arr, format='PNG')
             b_arr.seek(0)
@@ -285,7 +286,6 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
     p.setFont("Helvetica", 8)
     p.drawString(500, alto - 126, tipo_servicio_val)
     
-    # Tabla de Conceptos
     y_tabla = alto - 150
     lineas = datos.get("lineas", [])
     num_filas = max(len(lineas), 1)
@@ -377,24 +377,20 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
             
     if fotos_bytes:
         n_fotos = min(len(fotos_bytes), 3)
-        margen = 8
-        espacio_total_util = h_box - (2 * margen)
-        h_disponible_por_foto = espacio_total_util / n_fotos
-        w_disponible = w_box - (2 * margen)
-        
+        h_disponible_por_foto = (h_box - 20) / n_fotos
         for i, fb in enumerate(fotos_bytes[:3]):
             try:
                 p_foto = PILImage.open(io.BytesIO(fb))
                 w_orig, h_orig = p_foto.size
-                ratio = min(w_disponible / w_orig, (h_disponible_por_foto - 10) / h_orig)
+                ratio = min(150 / w_orig, (h_disponible_por_foto - 10) / h_orig)
                 w_render = w_orig * ratio
                 h_render = h_orig * ratio
                 
                 temp_foto_path = f"/tmp/foto_desp_{i}_{int(time.time()*1000)}.png"
                 p_foto.save(temp_foto_path)
                 
-                offset_y = (y_box + h_box - margen) - ((i + 1) * h_disponible_por_foto) + ((h_disponible_por_foto - h_render) / 2)
-                offset_x = 320 + margen + ((w_disponible - w_render) / 2)
+                offset_y = (y_box + h_box - 10) - ((i + 1) * h_disponible_por_foto) + ((h_disponible_por_foto - h_render) / 2)
+                offset_x = 320 + ((w_box - w_render) / 2)
                 
                 p.drawImage(temp_foto_path, offset_x, offset_y, width=w_render, height=h_render, preserveAspectRatio=True)
                 if os.path.exists(temp_foto_path):
@@ -406,8 +402,7 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
     buffer.seek(0)
     return buffer
 
-# ----------------- GESTIÓN DE SESIÓN Y STREAMLIT -----------------
-# Inicializar variables en session_state para que no se borren al descargar un archivo
+# ----------------- GESTIÓN DE SESIÓN PERSISTENTE -----------------
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.excel_salida = None
@@ -439,7 +434,7 @@ if uploaded_factura and api_key:
                 folio = str(datos.get("folio_factura", "RPS"))
                 oc = str(datos.get("orden_compra", "OC"))
                 
-                # Guardar en memoria de sesión persistente
+                # Guardar en memoria de sesión para que las descargas no se anulen
                 st.session_state.procesado = True
                 st.session_state.excel_salida = excel_salida.getvalue()
                 st.session_state.pdf_salida = pdf_salida.getvalue()
@@ -449,7 +444,7 @@ if uploaded_factura and api_key:
             except Exception as e:
                 st.error(f"Error al procesar: {e}")
 
-# Si ya fue procesado, mostrar siempre los dos botones de descarga
+# Mantener visibles ambos botones de descarga de forma permanente
 if st.session_state.procesado:
     total_lineas = len(st.session_state.datos.get("lineas", []))
     st.success(f"¡Documentos listos! ({total_lineas} partida(s) procesada(s))")
