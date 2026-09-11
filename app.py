@@ -213,34 +213,34 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         
     ws._images.clear()
 
-    # 1. ANTES: Anclado en T11 para bajarlo un poco más y centrarlo verticalmente
+    # 1. ANTES: Más grande y centrado en T10 (430px x 570px)
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
             img_oc_bytes = extraer_pagina_completa_oc(oc_bytes, pag_oc)
             img_oc = OpenpyxlImage(img_oc_bytes)
-            img_oc.width = 385
-            img_oc.height = 510
-            ws.add_image(img_oc, "T11")
+            img_oc.width = 430
+            img_oc.height = 570
+            ws.add_image(img_oc, "T10")
         except Exception:
             pass
             
-    # 2. DESPUÉS: Ancladas en columna AD (más al centro) y en filas AD11, AD18, AD25 con holgura
-    celdas_despues = ["AD11", "AD18", "AD25"]
+    # 2. DESPUÉS: Un poco más grandes (hasta 150px de alto x 195px de ancho) en AD10, AD17, AD24
+    celdas_despues = ["AD10", "AD17", "AD24"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
             pil_temp = PILImage.open(io.BytesIO(f_bytes))
             w_orig, h_orig = pil_temp.size
             
-            # Altura máxima de 135px para que nunca choquen ni se encimen
-            max_h = 135
+            # Altura deseada aumentada a 150px
+            max_h = 150
             ratio = max_h / float(h_orig)
             w_calc = int(w_orig * ratio)
             
-            # Limitar ancho máximo a 175px para no invadir laterales
-            if w_calc > 175:
-                w_calc = 175
-                max_h = int(h_orig * (175 / float(w_orig)))
+            # Ancho límite para no salirse de las columnas
+            if w_calc > 195:
+                w_calc = 195
+                max_h = int(h_orig * (195 / float(w_orig)))
 
             b_arr = io.BytesIO(f_bytes)
             excel_img = OpenpyxlImage(b_arr)
@@ -390,7 +390,7 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
             try:
                 p_foto = PILImage.open(io.BytesIO(fb))
                 w_orig, h_orig = p_foto.size
-                ratio = min(140 / w_orig, (h_disponible_por_foto - 10) / h_orig)
+                ratio = min(150 / w_orig, (h_disponible_por_foto - 10) / h_orig)
                 w_render = w_orig * ratio
                 h_render = h_orig * ratio
                 
