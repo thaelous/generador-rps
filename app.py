@@ -159,8 +159,8 @@ def extraer_pagina_completa_oc(oc_bytes, pagina_sugerida=None):
     page = doc[target_idx]
     pix = page.get_pixmap(dpi=150)
     img = PILImage.open(io.BytesIO(pix.tobytes("png")))
-    # Dimensiones para calzar entre columnas T y Z
-    img.thumbnail((330, 440), PILImage.Resampling.LANCZOS)
+    # Dimensiones para abarcar de columna R a AA y alto completo
+    img.thumbnail((480, 640), PILImage.Resampling.LANCZOS)
     
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='PNG')
@@ -215,22 +215,22 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         
     ws._images.clear()
 
-    # 1. ANTES: Anclado en T6 para centrarse entre las columnas T y Z
+    # 1. ANTES: Columna R fila 7 (abarca hasta AA y cubre el cuadro verticalmente)
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
             img_oc_bytes = extraer_pagina_completa_oc(oc_bytes, pag_oc)
             img_oc = OpenpyxlImage(img_oc_bytes)
-            ws.add_image(img_oc, "T6")
+            ws.add_image(img_oc, "R7")
         except Exception:
             pass
             
-    # 2. DESPUÉS: Anclado en AC6, AC13, AC20 según la referencia visual exacta
-    celdas_despues = ["AC6", "AC13", "AC20"]
+    # 2. DESPUÉS: Centradas en columna AE (filas 7, 14, 21) con tamaño proporcional de tarjeta
+    celdas_despues = ["AE7", "AE14", "AE21"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
             p_img = PILImage.open(io.BytesIO(f_bytes))
-            p_img.thumbnail((145, 150), PILImage.Resampling.LANCZOS)
+            p_img.thumbnail((210, 180), PILImage.Resampling.LANCZOS)
             b_arr = io.BytesIO()
             p_img.save(b_arr, format='PNG')
             b_arr.seek(0)
@@ -381,7 +381,7 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
             try:
                 p_foto = PILImage.open(io.BytesIO(fb))
                 w_orig, h_orig = p_foto.size
-                ratio = min(140 / w_orig, (h_disponible_por_foto - 10) / h_orig)
+                ratio = min(150 / w_orig, (h_disponible_por_foto - 10) / h_orig)
                 w_render = w_orig * ratio
                 h_render = h_orig * ratio
                 
