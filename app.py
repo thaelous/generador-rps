@@ -78,27 +78,32 @@ def extraer_datos(pdf_bytes, raw_key):
       "x-goog-api-key": clean_key,
   }
 
-  # Modelos Flash disponibles con cuota libre
   modelos = [
-      "gemini-2.5-flash",
       "gemini-2.5-flash-lite",
-      "gemini-flash-latest",
+      "gemini-2.5-flash",
+      "gemini-3.6-flash",
   ]
   ultimo_error = None
 
   for mod in modelos:
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent".strip()
-    try:
-      response = requests.post(url, headers=headers, json=payload, timeout=60)
-      if response.status_code == 200:
-        data = response.json()
-        texto = data["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(texto)
-      else:
-        ultimo_error = f"Código {response.status_code}: {response.text}"
-        time.sleep(1)
-    except Exception as e:
-      ultimo_error = str(e)
+    for intento in range(3):
+      try:
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        if response.status_code == 200:
+          data = response.json()
+          texto = data["candidates"][0]["content"]["parts"][0]["text"]
+          return json.loads(texto)
+        elif response.status_code in (429, 503):
+          ultimo_error = f"Código {response.status_code}: Servidor ocupado ({mod}). Reintentando..."
+          time.sleep(2 * (intento + 1))
+          continue
+        else:
+          ultimo_error = f"Código {response.status_code}: {response.text}"
+          break
+      except Exception as e:
+        ultimo_error = str(e)
+        time.sleep(2)
 
   raise RuntimeError(ultimo_error)
 
@@ -157,7 +162,7 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
   if lineas:
     l = lineas[0]
 
-    # Vacío en '# de línea en PO'
+    # Dejar vacío '# de línea en PO'
     ws.cell(row=15, column=1, value="")
 
     # Cantidad
@@ -175,7 +180,7 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
     ws.cell(row=15, column=5, value=l.get("monto", datos.get("subtotal", 0)))
     ws.cell(row=15, column=6, value=datos.get("moneda", "MXN"))
 
-    # Descripción limpia (sin solicitante ni OC)
+    # Descripción limpia sin solicitante ni OC
     desc_original = l.get("descripcion", "")
     desc_limpia = limpiar_descripcion(desc_original, solicitante_val, oc_val)
     ws.cell(row=15, column=7, value=desc_limpia)
