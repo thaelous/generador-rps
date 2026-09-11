@@ -213,41 +213,39 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         
     ws._images.clear()
 
-    # 1. ANTES: Anclado en T10 (un renglón más abajo para margen perfecto)
+    # 1. ANTES: Anclado en T11 para bajarlo un poco más y centrarlo verticalmente
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
             img_oc_bytes = extraer_pagina_completa_oc(oc_bytes, pag_oc)
             img_oc = OpenpyxlImage(img_oc_bytes)
-            # Mantener tamaño proporcional sin desbordar
             img_oc.width = 385
-            img_oc.height = 515
-            ws.add_image(img_oc, "T10")
+            img_oc.height = 510
+            ws.add_image(img_oc, "T11")
         except Exception:
             pass
             
-    # 2. DESPUÉS: Ancladas un renglón más abajo (AE10, AE16, AE22) y respetando escala original exacta
-    celdas_despues = ["AE10", "AE16", "AE22"]
+    # 2. DESPUÉS: Ancladas en columna AD (más al centro) y en filas AD11, AD18, AD25 con holgura
+    celdas_despues = ["AD11", "AD18", "AD25"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
-            # Abrir para obtener proporciones originales
             pil_temp = PILImage.open(io.BytesIO(f_bytes))
             w_orig, h_orig = pil_temp.size
             
-            # Ancho objetivo sin deformar: 180px
-            ancho_deseado = 180
-            ratio = ancho_deseado / float(w_orig)
-            alto_proporcional = int(h_orig * ratio)
+            # Altura máxima de 135px para que nunca choquen ni se encimen
+            max_h = 135
+            ratio = max_h / float(h_orig)
+            w_calc = int(w_orig * ratio)
             
-            # Limitar alto máximo a 160px para que no invada la siguiente foto
-            if alto_proporcional > 160:
-                alto_proporcional = 160
-                ancho_deseado = int(w_orig * (160 / float(h_orig)))
+            # Limitar ancho máximo a 175px para no invadir laterales
+            if w_calc > 175:
+                w_calc = 175
+                max_h = int(h_orig * (175 / float(w_orig)))
 
             b_arr = io.BytesIO(f_bytes)
             excel_img = OpenpyxlImage(b_arr)
-            excel_img.width = ancho_deseado
-            excel_img.height = alto_proporcional
+            excel_img.width = w_calc
+            excel_img.height = max_h
             ws.add_image(excel_img, celdas_despues[i])
         except Exception:
             pass
@@ -361,7 +359,6 @@ def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
     p.drawString(40, alto - 67, "NOTA: SOLO APLICA PARA SERVICIOS")
     
     p.setFont("Helvetica-Bold", 9)
-    p.setFillColor(colors.black)
     p.drawString(135, alto - 90, "FOTOS DEL ANTES")
     p.drawString(395, alto - 90, "FOTOS DEL DESPUES")
     
