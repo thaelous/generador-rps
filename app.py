@@ -2,6 +2,8 @@ import base64
 import io
 import json
 import os
+import re
+import time
 import openpyxl
 import requests
 import streamlit as st
@@ -47,7 +49,8 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
 }
 Reglas estrictas:
 - En 'orden_compra' coloca solo números o el código limpio (ej. si dice 'OC 786794', extrae '786794').
-- En 'solicitante', revisa tanto los campos de adenda como el texto dentro de la descripción del concepto.
+- En 'solicitante', extrae el nombre de la persona que solicita el servicio (revisa la adenda o el cuerpo de la descripción).
+- En 'lineas.descripcion', coloca ÚNICAMENTE el concepto o servicio brindado. ELIMINA por completo cualquier mención al nombre del solicitante y al número de OC/PO (ej. no incluir 'Solicitante: Juan Perez', ni 'OC 786794').
 - Devuelve únicamente el JSON sin comentarios ni bloques adicionales.
 """
 
@@ -75,9 +78,11 @@ def extraer_datos(pdf_bytes, raw_key):
       "x-goog-api-key": clean_key,
   }
 
+  # Modelos Flash disponibles con cuota libre
   modelos = [
-      "gemini-3.6-flash",
-      "gemini-3.1-pro-preview",
+      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
+      "gemini-flash-latest",
   ]
   ultimo_error = None
 
@@ -91,10 +96,36 @@ def extraer_datos(pdf_bytes, raw_key):
         return json.loads(texto)
       else:
         ultimo_error = f"Código {response.status_code}: {response.text}"
+        time.sleep(1)
     except Exception as e:
       ultimo_error = str(e)
 
   raise RuntimeError(ultimo_error)
+
+
+def limpiar_descripcion(desc, solicitante, oc):
+  texto = desc
+
+  if solicitante and solicitante.strip():
+    patron_sol = re.compile(re.escape(solicitante.strip()), re.IGNORECASE)
+    texto = patron_sol.sub("", texto)
+
+  texto = re.sub(
+      r"(?i)(solicita(?:nte)?|atenci[oó]n|contacto)\s*[:\-]?\s*", "", texto
+  )
+
+  if oc and str(oc).strip():
+    patron_oc = re.compile(
+        rf"(?i)(?:oc|orden\s*(?:de)?\s*compra|po)\s*[:#\-]?\s*{re.escape(str(oc).strip())}"
+    )
+    texto = patron_oc.sub("", texto)
+    texto = re.sub(rf"\b{re.escape(str(oc).strip())}\b", "", texto)
+
+  texto = re.sub(r"(?i)\b(?:oc|po)\s*[:#\-]?\b", "", texto)
+  texto = re.sub(r"\s+", " ", texto)
+  texto = re.sub(r"^[\s,\.\-_/]+|[\s,\.\-_/]+$", "", texto)
+
+  return texto.strip()
 
 
 def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
@@ -102,22 +133,23 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
   ws = wb["3151"] if "3151" in wb.sheetnames else wb.active
 
   folio = str(datos.get("folio_factura", "RPS"))
+  oc_val = datos.get("orden_compra", "")
+  solicitante_val = datos.get("solicitante", "")
   ws.title = folio
 
   # 1. Orden de Compra (Fila 7, Columna E)
-  if datos.get("orden_compra"):
-    oc = datos["orden_compra"]
+  if oc_val:
     ws.cell(
-        row=7, column=5, value=int(oc) if str(oc).isdigit() else str(oc)
+        row=7,
+        column=5,
+        value=int(oc_val) if str(oc_val).isdigit() else str(oc_val),
     )
 
   # 2. Proveedor (Fila 9, Columna E)
   ws.cell(row=9, column=5, value=datos.get("nombre_proveedor", ""))
 
   # 3. Folio Factura (Fila 11, Columna E) y Tipo de Servicio (Fila 11, Columna J)
-  ws.cell(
-      row=11, column=5, value=int(folio) if folio.isdigit() else str(folio)
-  )
+  ws.cell(row=11, column=5, value=int(folio) if folio.isdigit() else str(folio))
   ws.cell(row=11, column=10, value=datos.get("tipo_servicio", "Entrenamiento"))
 
   # 4. Detalle de Concepto (Fila 15)
@@ -125,12 +157,13 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
   if lineas:
     l = lineas[0]
 
-    # Dejar vacío # de línea en PO
+    # Vacío en '# de línea en PO'
     ws.cell(row=15, column=1, value="")
 
+    # Cantidad
     ws.cell(row=15, column=2, value=l.get("cantidad", 1))
 
-    # Limpiar E48 si viene en la unidad
+    # Unidad limpia sin E48
     unidad = str(l.get("unidad", "LOT")).strip()
     if "E48" in unidad.upper() or not unidad:
       unidad = "LOT"
@@ -138,9 +171,15 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
       unidad = unidad.replace("E48", "").replace("-", "").strip()
     ws.cell(row=15, column=4, value=unidad)
 
+    # Monto y Moneda
     ws.cell(row=15, column=5, value=l.get("monto", datos.get("subtotal", 0)))
     ws.cell(row=15, column=6, value=datos.get("moneda", "MXN"))
-    ws.cell(row=15, column=7, value=l.get("descripcion", ""))
+
+    # Descripción limpia (sin solicitante ni OC)
+    desc_original = l.get("descripcion", "")
+    desc_limpia = limpiar_descripcion(desc_original, solicitante_val, oc_val)
+    ws.cell(row=15, column=7, value=desc_limpia)
+
     ws.cell(row=15, column=16, value="YES")
 
   # 5. Monto Total a Recibir (Fila 25, Columnas E y F)
@@ -149,13 +188,13 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
   ws.cell(row=25, column=6, value=subtotal)
 
   # 6. Solicitante (Fila 27, Columna C)
-  if datos.get("solicitante"):
-    ws.cell(row=27, column=3, value=datos["solicitante"])
+  if solicitante_val:
+    ws.cell(row=27, column=3, value=solicitante_val)
 
   output = io.BytesIO()
   wb.save(output)
   output.seek(0)
-  return output, folio, datos.get("orden_compra", "RPS")
+  return output, folio, oc_val if oc_val else "RPS"
 
 
 if uploaded_pdf and api_key:
