@@ -89,8 +89,8 @@ def auditar_y_extraer(factura_bytes, oc_bytes, raw_key):
     else:
         prompt_usuario += "No se adjuntó OC. Extrae únicamente los datos de la factura con 'documentos_coinciden': true."
 
-    # Intentos de ejecución con el SDK oficial
-    modelos = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    # Modelos recomendados por la API de Google
+    modelos = ["gemini-3.5-flash-lite", "gemini-3.5-flash"]
     ultimo_error = None
 
     for mod in modelos:
