@@ -11,29 +11,22 @@ from PIL import Image as PILImage
 import fitz  # PyMuPDF
 import streamlit as st
 
-# ReportLab para la generación del PDF oficial
-from reportlab.lib.pagesizes import letter, landscape
+from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 
 st.set_page_config(page_title="Generador RPS AAM", page_icon="📄", layout="centered")
 st.title("Generador Automático de RPS con Evidencias")
-st.write("Sube la Factura, la Orden de Compra y tus evidencias para obtener tu Excel y PDF listos.")
+st.write("Sube la Factura, la Orden de Compra y las fotos de evidencia para generar tu Excel y PDF oficiales.")
 
 api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
 if not api_key:
     api_key = st.text_input("Ingresa tu Gemini API Key:", type="password")
 
-# Insumos
 uploaded_factura = st.file_uploader("1. Factura en PDF (CFDI)", type=["pdf"])
 uploaded_oc = st.file_uploader("2. Orden de Compra en PDF (OC)", type=["pdf"])
 uploaded_fotos = st.file_uploader("3. Fotos de Evidencia ('DESPUÉS' - hasta 3 imágenes)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
-
-linea_po_manual = st.text_input(
-    "Número de línea en PO (Opcional - La IA lo detectará automáticamente si lo dejas vacío):", 
-    placeholder="Ej. 3-1 o déjalo vacío"
-)
 
 SYSTEM_PROMPT = """
 Eres un auditor contable corporativo. Se te proporcionan dos documentos:
@@ -41,11 +34,11 @@ Eres un auditor contable corporativo. Se te proporcionan dos documentos:
 2. Orden de Compra (OC en PDF).
 
 Tu tarea:
-1. Extraer los datos fiscales del CFDI para el formato RPS.
-2. Comparar el concepto y monto facturado contra la tabla de partidas de la Orden de Compra.
-3. Identificar el número de línea que corresponde al servicio facturado en la OC y formatearlo estrictamente como 'X-1' (por ejemplo: '1-1', '2-1', '3-1', etc.).
+1. Extraer los datos fiscales del CFDI y los generales de la OC para el formato RPS.
+2. Identificar la página específica de la Orden de Compra (número de página base 1) donde aparece la partida o tabla de partidas facturadas.
+3. Extraer todas las líneas facturadas. Si hay más de un concepto o partida, extraer cada uno en el arreglo 'lineas'. Para cada línea, identificar su número de línea en la OC y formatearlo estrictamente como 'X-1' (por ejemplo: '1-1', '2-1', '3-1').
 
-Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
+Devuelve EXCLUSIVAMENTE un objeto JSON con la siguiente estructura:
 {
   "orden_compra": string,
   "nombre_proveedor": string,
@@ -54,9 +47,10 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
   "solicitante": string,
   "moneda": string,
   "subtotal": number,
-  "linea_po_detectada": string,
+  "pagina_oc_partida": number,
   "lineas": [
     {
+      "linea_po": string,
       "cantidad": number,
       "unidad": string,
       "descripcion": string,
@@ -66,11 +60,10 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
 }
 
 Reglas estrictas:
-- En 'linea_po_detectada', coloca el código de línea correspondiente en la OC en formato 'X-1'. Si no lo encuentras con certeza, usa '1-1'.
-- En 'orden_compra' coloca solo números o el código limpio.
-- En 'solicitante', extrae el nombre de la persona que solicita el servicio.
-- En 'lineas.descripcion', coloca ÚNICAMENTE el concepto o servicio. ELIMINA menciones al solicitante y a la OC/PO.
-- Devuelve únicamente el JSON sin comentarios.
+- 'pagina_oc_partida': número entero de la página del PDF de la OC donde está el renglón/partida facturada (ej. 4).
+- 'lineas.linea_po': código en formato 'X-1' correspondiente a esa partida en la OC.
+- 'lineas.descripcion': sólo el concepto del servicio, eliminando solicitante y número de OC/PO.
+- Devuelve únicamente el JSON válido.
 """
 
 def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
@@ -79,17 +72,17 @@ def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
     
     parts = [
         {"inline_data": {"mime_type": "application/pdf", "data": fac_b64}},
-        {"text": "Documento 1: Factura emitida (CFDI)."}
+        {"text": "Factura emitida (CFDI)."}
     ]
     
     if oc_bytes:
         oc_b64 = base64.b64encode(oc_bytes).decode('utf-8')
         parts.extend([
             {"inline_data": {"mime_type": "application/pdf", "data": oc_b64}},
-            {"text": "Documento 2: Orden de Compra oficial (OC). Cruza el concepto facturado con la OC para identificar la línea de PO en formato 'X-1'."}
+            {"text": "Orden de Compra oficial (OC). Cruza las partidas facturadas con las líneas de la OC, extrae cada partida con su línea 'X-1' e indica en 'pagina_oc_partida' la página exacta donde se visualiza el renglón."}
         ])
     else:
-        parts.append({"text": "No se adjuntó OC. Extrae únicamente los datos de la factura."})
+        parts.append({"text": "Extrae los datos únicamente de la factura."})
 
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -149,24 +142,31 @@ def limpiar_descripcion(desc, solicitante, oc):
     texto = re.sub(r'^[\s,\.\-_/]+|[\s,\.\-_/]+$', '', texto)
     return texto.strip()
 
-def extraer_pagina_partidas_oc(oc_bytes):
+def extraer_pagina_completa_oc(oc_bytes, pagina_sugerida=None):
     doc = fitz.open(stream=oc_bytes, filetype="pdf")
-    target_page_idx = 0
-    for i, page in enumerate(doc):
-        texto = page.get_text()
-        if "Partida/Descripción" in texto or "Precio ampliado" in texto or "Precio unitario" in texto:
-            target_page_idx = i
-            break
-    page = doc[target_page_idx]
+    total_paginas = len(doc)
+    target_idx = 0
+    
+    if pagina_sugerida and isinstance(pagina_sugerida, int) and 1 <= pagina_sugerida <= total_paginas:
+        target_idx = pagina_sugerida - 1
+    else:
+        for i, page in enumerate(doc):
+            t = page.get_text()
+            if "Partida/Descripción" in t or "Precio ampliado" in t or "Precio unitario" in t:
+                target_idx = i
+                break
+                
+    page = doc[target_idx]
     pix = page.get_pixmap(dpi=150)
     img = PILImage.open(io.BytesIO(pix.tobytes("png")))
-    img.thumbnail((380, 520), PILImage.Resampling.LANCZOS)
+    img.thumbnail((390, 520), PILImage.Resampling.LANCZOS)
+    
     img_byte_arr = io.BytesIO()
     img.save(img_byte_arr, format='PNG')
     img_byte_arr.seek(0)
     return img_byte_arr
 
-def llenar_plantilla_excel(datos, linea_po_final, oc_bytes=None, fotos_bytes=[], plantilla_path="plantilla_RPS.xlsx"):
+def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path="plantilla_RPS.xlsx"):
     wb = openpyxl.load_workbook(plantilla_path)
     ws = wb["3151"] if "3151" in wb.sheetnames else wb.active
     
@@ -183,25 +183,27 @@ def llenar_plantilla_excel(datos, linea_po_final, oc_bytes=None, fotos_bytes=[],
     ws.cell(row=11, column=10, value=datos.get("tipo_servicio", "Entrenamiento"))
     
     lineas = datos.get("lineas", [])
-    if lineas:
-        l = lineas[0]
-        ws.cell(row=15, column=1, value=linea_po_final)
-        ws.cell(row=15, column=2, value=l.get("cantidad", 1))
+    fila_inicio = 15
+    for idx, l in enumerate(lineas):
+        r = fila_inicio + idx
+        if r > 24:
+            break
+        ws.cell(row=r, column=1, value=l.get("linea_po", "1-1"))
+        ws.cell(row=r, column=2, value=l.get("cantidad", 1))
         
         unidad = str(l.get("unidad", "LOT")).strip()
         if "E48" in unidad.upper() or not unidad:
             unidad = "LOT"
         else:
             unidad = unidad.replace("E48", "").replace("-", "").strip()
-        ws.cell(row=15, column=4, value=unidad)
+        ws.cell(row=r, column=4, value=unidad)
         
-        ws.cell(row=15, column=5, value=l.get("monto", datos.get("subtotal", 0)))
-        ws.cell(row=15, column=6, value=datos.get("moneda", "MXN"))
+        ws.cell(row=r, column=5, value=l.get("monto", 0))
+        ws.cell(row=r, column=6, value=datos.get("moneda", "MXN"))
         
-        desc_original = l.get("descripcion", "")
-        desc_limpia = limpiar_descripcion(desc_original, solicitante_val, oc_val)
-        ws.cell(row=15, column=7, value=desc_limpia)
-        ws.cell(row=15, column=16, value="YES")
+        desc_limpia = limpiar_descripcion(l.get("descripcion", ""), solicitante_val, oc_val)
+        ws.cell(row=r, column=7, value=desc_limpia)
+        ws.cell(row=r, column=16, value="YES")
         
     subtotal = datos.get("subtotal", 0)
     ws.cell(row=25, column=5, value=subtotal)
@@ -214,17 +216,18 @@ def llenar_plantilla_excel(datos, linea_po_final, oc_bytes=None, fotos_bytes=[],
 
     if oc_bytes:
         try:
-            img_oc_bytes = extraer_pagina_partidas_oc(oc_bytes)
+            pag_oc = datos.get("pagina_oc_partida")
+            img_oc_bytes = extraer_pagina_completa_oc(oc_bytes, pag_oc)
             img_oc = OpenpyxlImage(img_oc_bytes)
             ws.add_image(img_oc, "S8")
         except Exception:
             pass
             
-    celdas_despues = ["AC8", "AC15", "AC22"]
+    celdas_despues = ["AC8", "AC14", "AC20"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
             p_img = PILImage.open(io.BytesIO(f_bytes))
-            p_img.thumbnail((320, 150), PILImage.Resampling.LANCZOS)
+            p_img.thumbnail((320, 130), PILImage.Resampling.LANCZOS)
             b_arr = io.BytesIO()
             p_img.save(b_arr, format='PNG')
             b_arr.seek(0)
@@ -239,32 +242,29 @@ def llenar_plantilla_excel(datos, linea_po_final, oc_bytes=None, fotos_bytes=[],
     output.seek(0)
     return output
 
-def generar_pdf_oficial(datos, linea_po_final, oc_bytes=None, fotos_bytes=[]):
-    """Genera exactamente el PDF de 2 páginas del RPS con ReportLab"""
+def generar_pdf_oficial(datos, oc_bytes=None, fotos_bytes=[]):
     buffer = io.BytesIO()
     p = canvas.Canvas(buffer, pagesize=letter)
     ancho, alto = letter
     
     # ------------------ PÁGINA 1: FORMATO RPS ------------------
-    # Encabezado rojo / logo
     p.setFillColor(colors.HexColor("#C00000"))
     p.setFont("Helvetica-Bold", 16)
-    p.drawString(40, alto - 50, "AAM")
+    p.drawString(40, alto - 45, "AAM")
     p.setFillColor(colors.black)
-    p.setFont("Helvetica-Bold", 13)
-    p.drawString(100, alto - 50, "REPLACEMENT PACKING SLIP")
+    p.setFont("Helvetica-Bold", 12)
+    p.drawString(95, alto - 45, "REPLACEMENT PACKING SLIP")
     
-    p.setFont("Helvetica-Bold", 7)
+    p.setFont("Helvetica-Bold", 6.5)
     p.setFillColor(colors.HexColor("#C00000"))
-    p.drawString(40, alto - 65, "INSTRUCCIONES: TODOS LOS CAMPOS SOMBREADOS DEBEN SER LLENADOS PARA PODER PROCEDER CON EL RECIBO.")
-    p.drawString(40, alto - 75, "ES NECESARIO ADJUNTAR LA FACTURA A ESTE DOCUMENTO")
+    p.drawString(40, alto - 58, "INSTRUCCIONES: TODOS LOS CAMPOS SOMBREADOS DEBEN SER LLENADOS PARA PODER PROCEDER CON EL RECIBO.")
+    p.drawString(40, alto - 67, "ES NECESARIO ADJUNTAR LA FACTURA A ESTE DOCUMENTO")
     
-    # Cajas de datos principales
     p.setFont("Helvetica-Bold", 8)
     p.setFillColor(colors.black)
-    p.drawString(40, alto - 100, "ORDEN DE COMPRA #:")
-    p.drawString(40, alto - 120, "NOMBRE DE PROVEEDOR:")
-    p.drawString(40, alto - 140, "FACTURA #:")
+    p.drawString(40, alto - 90, "ORDEN DE COMPRA #:")
+    p.drawString(40, alto - 108, "NOMBRE DE PROVEEDOR:")
+    p.drawString(40, alto - 126, "FACTURA #:")
     
     p.setFont("Helvetica", 8)
     oc_val = str(datos.get("orden_compra", ""))
@@ -273,99 +273,99 @@ def generar_pdf_oficial(datos, linea_po_final, oc_bytes=None, fotos_bytes=[]):
     solicitante_val = str(datos.get("solicitante", ""))
     tipo_servicio_val = str(datos.get("tipo_servicio", "Entrenamiento"))
     
-    # Valores sombreados
-    p.drawString(170, alto - 100, oc_val)
-    p.drawString(170, alto - 120, proveedor_val)
-    p.drawString(170, alto - 140, folio_val)
+    p.drawString(170, alto - 90, oc_val)
+    p.drawString(170, alto - 108, proveedor_val)
+    p.drawString(170, alto - 126, folio_val)
     
     p.setFont("Helvetica-Bold", 8)
-    p.drawString(380, alto - 140, "TIPO DE SERVICIO A RECIBIR:")
+    p.drawString(370, alto - 126, "TIPO DE SERVICIO A RECIBIR:")
     p.setFont("Helvetica", 8)
-    p.drawString(510, alto - 140, tipo_servicio_val)
+    p.drawString(500, alto - 126, tipo_servicio_val)
     
-    # Tabla de Concepto
-    y_tabla = alto - 170
+    # Tabla de Conceptos
+    y_tabla = alto - 150
+    lineas = datos.get("lineas", [])
+    num_filas = max(len(lineas), 1)
+    altura_tabla = 20 + (num_filas * 18)
+    
     p.setFillColor(colors.HexColor("#FFF2CC"))
-    p.rect(40, y_tabla - 60, ancho - 80, 60, fill=1, stroke=1)
+    p.rect(40, y_tabla - altura_tabla, ancho - 80, altura_tabla, fill=1, stroke=1)
     
     p.setFillColor(colors.black)
     p.setFont("Helvetica-Bold", 7)
     p.drawString(45, y_tabla - 12, "# DE LINEA PO")
-    p.drawString(105, y_tabla - 12, "CANT.")
-    p.drawString(135, y_tabla - 12, "UOM")
-    p.drawString(165, y_tabla - 12, "MONTO A RECIBIR")
-    p.drawString(250, y_tabla - 12, "MONEDA")
-    p.drawString(300, y_tabla - 12, "DESCRIPCIÓN DE LA LINEA A RECIBIR")
-    p.drawString(520, y_tabla - 12, "COMPLETA?")
+    p.drawString(110, y_tabla - 12, "CANT.")
+    p.drawString(140, y_tabla - 12, "UOM")
+    p.drawString(170, y_tabla - 12, "MONTO A RECIBIR")
+    p.drawString(255, y_tabla - 12, "MONEDA")
+    p.drawString(305, y_tabla - 12, "DESCRIPCIÓN DE LA LINEA A RECIBIR")
+    p.drawString(525, y_tabla - 12, "COMPLETA?")
     
-    lineas = datos.get("lineas", [])
     subtotal = datos.get("subtotal", 0)
     moneda = datos.get("moneda", "MXN")
-    desc = ""
-    if lineas:
-        l = lineas[0]
-        desc = limpiar_descripcion(l.get("descripcion", ""), solicitante_val, oc_val)
+    
+    p.setFont("Helvetica", 7)
+    for i, l in enumerate(lineas):
+        y_fila = y_tabla - 28 - (i * 18)
+        desc_l = limpiar_descripcion(l.get("descripcion", ""), solicitante_val, oc_val)
+        monto_l = l.get("monto", subtotal)
+        p.drawString(45, y_fila, str(l.get("linea_po", "1-1")))
+        p.drawString(115, y_fila, str(l.get("cantidad", 1)))
+        p.drawString(140, y_fila, str(l.get("unidad", "LOT")))
+        p.drawString(170, y_fila, f"${monto_l:,.2f}")
+        p.drawString(260, y_fila, moneda)
+        p.drawString(305, y_fila, desc_l[:48])
+        p.drawString(535, y_fila, "YES")
         
-    p.setFont("Helvetica", 7.5)
-    p.drawString(45, y_tabla - 35, str(linea_po_final))
-    p.drawString(110, y_tabla - 35, "1")
-    p.drawString(135, y_tabla - 35, "LOT")
-    p.drawString(165, y_tabla - 35, f"${subtotal:,.2f}")
-    p.drawString(255, y_tabla - 35, moneda)
-    p.drawString(300, y_tabla - 35, desc[:55])
-    p.drawString(530, y_tabla - 35, "YES")
-    
-    # Totales y Solicitante
+    y_totales = y_tabla - altura_tabla - 25
     p.setFont("Helvetica-Bold", 8)
-    p.drawString(40, y_tabla - 85, "MONTO TOTAL A RECIBIR:")
-    p.drawString(165, y_tabla - 85, f"${subtotal:,.2f} {moneda}")
+    p.drawString(40, y_totales, "MONTO TOTAL A RECIBIR:")
+    p.drawString(170, y_totales, f"${subtotal:,.2f} {moneda}")
     
-    p.drawString(40, y_tabla - 120, "SOLICITANTE:")
+    p.drawString(40, y_totales - 30, "SOLICITANTE:")
     p.setFont("Helvetica", 8)
-    p.drawString(120, y_tabla - 120, solicitante_val)
+    p.drawString(120, y_totales - 30, solicitante_val)
     
     p.setFont("Helvetica-Bold", 8)
-    p.drawString(40, y_tabla - 145, "APROBADOR:")
+    p.drawString(40, y_totales - 55, "APROBADOR:")
     p.setFont("Helvetica", 8)
-    p.drawString(120, y_tabla - 145, "Laura Maciel Hernández")
+    p.drawString(120, y_totales - 55, "Laura Maciel Hernández 014036")
     
-    p.showPage()  # Siguiente página
+    p.showPage()
     
-    # ------------------ PÁGINA 2: EVIDENCIAS (ANTES Y DESPUÉS) ------------------
+    # ------------------ PÁGINA 2: EVIDENCIAS ------------------
     p.setFillColor(colors.HexColor("#C00000"))
     p.setFont("Helvetica-Bold", 16)
-    p.drawString(40, alto - 50, "AAM")
+    p.drawString(40, alto - 45, "AAM")
     p.setFillColor(colors.black)
-    p.setFont("Helvetica-Bold", 13)
-    p.drawString(100, alto - 50, "REPLACEMENT PACKING SLIP EVIDENCE")
+    p.setFont("Helvetica-Bold", 12)
+    p.drawString(95, alto - 45, "REPLACEMENT PACKING SLIP EVIDENCE")
     
-    p.setFont("Helvetica-Bold", 7)
+    p.setFont("Helvetica-Bold", 6.5)
     p.setFillColor(colors.HexColor("#C00000"))
-    p.drawString(40, alto - 65, "INSTRUCCIONES: LAS FOTOS DEBEN ESTAR DEL TAMAÑO DEL RECUADRO MARCADO Y RESOLUCIÓN DE CALIDAD")
-    p.drawString(40, alto - 75, "NOTA: SOLO APLICA PARA SERVICIOS")
+    p.drawString(40, alto - 58, "INSTRUCCIONES: LAS FOTOS DEBEN ESTAR DEL TAMAÑO DEL RECUADRO MARCADO Y RESOLUCIÓN DE CALIDAD")
+    p.drawString(40, alto - 67, "NOTA: SOLO APLICA PARA SERVICIOS")
     
-    # Títulos de las cajas
     p.setFont("Helvetica-Bold", 9)
     p.setFillColor(colors.black)
-    p.drawString(130, alto - 100, "FOTOS DEL ANTES")
-    p.drawString(390, alto - 100, "FOTOS DEL DESPUES")
+    p.drawString(135, alto - 90, "FOTOS DEL ANTES")
+    p.drawString(395, alto - 90, "FOTOS DEL DESPUES")
     
-    # Recuadro ANTES (Izquierda)
     w_box = 245
-    h_box = 480
+    h_box = 490
     y_box = alto - 595
-    p.setStrokeColor(colors.gray)
+    p.setStrokeColor(colors.HexColor("#A6A6A6"))
+    p.setLineWidth(1)
     p.rect(40, y_box, w_box, h_box, fill=0, stroke=1)
-    
-    # Recuadro DESPUÉS (Derecha)
     p.rect(320, y_box, w_box, h_box, fill=0, stroke=1)
     
-    # Pegar imagen de la OC en el ANTES
+    # Pegar Hoja Completa de la OC
     if oc_bytes:
         try:
-            img_oc_io = extraer_pagina_partidas_oc(oc_bytes)
+            pag_oc = datos.get("pagina_oc_partida")
+            img_oc_io = extraer_pagina_completa_oc(oc_bytes, pag_oc)
             pil_oc = PILImage.open(img_oc_io)
-            temp_oc_path = f"/tmp/oc_{int(time.time())}.png"
+            temp_oc_path = f"/tmp/oc_full_{int(time.time()*1000)}.png"
             pil_oc.save(temp_oc_path)
             p.drawImage(temp_oc_path, 45, y_box + 10, width=w_box - 10, height=h_box - 20, preserveAspectRatio=True)
             if os.path.exists(temp_oc_path):
@@ -373,17 +373,29 @@ def generar_pdf_oficial(datos, linea_po_final, oc_bytes=None, fotos_bytes=[]):
         except Exception:
             pass
             
-    # Pegar fotos en el DESPUÉS
+    # Pegar Fotos de Evidencia bien distribuidas dentro del recuadro derecho
     if fotos_bytes:
         n_fotos = min(len(fotos_bytes), 3)
-        h_foto = (h_box - 20) / n_fotos
+        margen = 8
+        espacio_total_util = h_box - (2 * margen)
+        h_disponible_por_foto = espacio_total_util / n_fotos
+        w_disponible = w_box - (2 * margen)
+        
         for i, fb in enumerate(fotos_bytes[:3]):
             try:
                 p_foto = PILImage.open(io.BytesIO(fb))
-                temp_foto_path = f"/tmp/foto_{i}_{int(time.time())}.png"
+                w_orig, h_orig = p_foto.size
+                ratio = min(w_disponible / w_orig, (h_disponible_por_foto - 10) / h_orig)
+                w_render = w_orig * ratio
+                h_render = h_orig * ratio
+                
+                temp_foto_path = f"/tmp/foto_desp_{i}_{int(time.time()*1000)}.png"
                 p_foto.save(temp_foto_path)
-                y_pos = (y_box + h_box - 10) - (i + 1) * h_foto
-                p.drawImage(temp_foto_path, 325, y_pos + 5, width=w_box - 10, height=h_foto - 10, preserveAspectRatio=True)
+                
+                offset_y = (y_box + h_box - margen) - ((i + 1) * h_disponible_por_foto) + ((h_disponible_por_foto - h_render) / 2)
+                offset_x = 320 + margen + ((w_disponible - w_render) / 2)
+                
+                p.drawImage(temp_foto_path, offset_x, offset_y, width=w_render, height=h_render, preserveAspectRatio=True)
                 if os.path.exists(temp_foto_path):
                     os.remove(temp_foto_path)
             except Exception:
@@ -393,39 +405,31 @@ def generar_pdf_oficial(datos, linea_po_final, oc_bytes=None, fotos_bytes=[]):
     buffer.seek(0)
     return buffer
 
-# ----------------- EJECUCIÓN STREAMLIT -----------------
 if uploaded_factura and api_key:
-    if st.button("Procesar Factura y Generar Documentos"):
-        with st.spinner("Analizando factura y OC con IA, extrayendo línea y generando archivos..."):
+    if st.button("Procesar y Generar Documentos"):
+        with st.spinner("Analizando documentos con IA y ensamblando archivos..."):
             try:
                 oc_bytes = uploaded_oc.getvalue() if uploaded_oc else None
                 fotos_bytes = [f.getvalue() for f in uploaded_fotos] if uploaded_fotos else []
                 
-                # 1. Extracción y cruce inteligente
                 datos = extraer_datos_con_oc(uploaded_factura.getvalue(), oc_bytes, api_key)
                 
-                # Si el usuario escribió manualmente la línea se respeta; si no, toma la detectada por la IA
-                linea_po_final = linea_po_manual.strip() if linea_po_manual.strip() else datos.get("linea_po_detectada", "1-1")
-                
-                # 2. Generar Excel
                 excel_salida = llenar_plantilla_excel(
                     datos, 
-                    linea_po_final=linea_po_final,
                     oc_bytes=oc_bytes,
                     fotos_bytes=fotos_bytes
                 )
                 
-                # 3. Generar PDF Oficial
                 pdf_salida = generar_pdf_oficial(
                     datos,
-                    linea_po_final=linea_po_final,
                     oc_bytes=oc_bytes,
                     fotos_bytes=fotos_bytes
                 )
                 
-                st.success(f"¡Documentos generados exitosamente! (Línea de PO asignada: {linea_po_final})")
+                total_lineas = len(datos.get("lineas", []))
+                st.success(f"¡RPS generado con éxito! ({total_lineas} partida(s) detectada(s))")
                 
-                with st.expander("Ver datos extraídos y validados por la IA"):
+                with st.expander("Ver detalle de datos extraídos"):
                     st.json(datos)
                 
                 folio = str(datos.get("folio_factura", "RPS"))
