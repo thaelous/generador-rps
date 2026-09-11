@@ -1,9 +1,9 @@
+import base64
 import io
 import json
 import os
-import time
-import google.generativeai as genai
 import openpyxl
+import requests
 import streamlit as st
 
 st.set_page_config(
@@ -15,7 +15,6 @@ st.write(
     " logos y formato oficial."
 )
 
-# Obtener la API key de los Secrets de Streamlit
 api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
 if not api_key:
@@ -49,37 +48,49 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
 Reglas estrictas:
 - En 'orden_compra' coloca solo números o el código limpio (ej. si dice 'OC 786794', extrae '786794').
 - En 'solicitante', revisa tanto los campos de adenda como el texto dentro de la descripción del concepto.
-- Devuelve únicamente el JSON sin comentarios adicionales.
+- Devuelve únicamente el JSON sin bloques Markdown de código (sin ```json).
 """
 
 
-def extraer_datos(pdf_bytes, key):
-  genai.configure(api_key=key)
+def extraer_datos_rest(pdf_bytes, key):
+  modelos = [
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
+  ]
+  pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-  modelos = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+  payload = {
+      "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+      "contents": [{
+          "parts": [
+              {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+              {"text": "Extrae los datos de esta factura para llenar el RPS."},
+          ]
+      }],
+      "generationConfig": {
+          "response_mime_type": "application/json",
+          "temperature": 0.1,
+      },
+  }
+
+  headers = {"Content-Type": "application/json", "x-goog-api-key": key.strip()}
+
   ultimo_error = None
-
-  for mod_name in modelos:
+  for mod in modelos:
+    url = f"[https://generativelanguage.googleapis.com/v1beta/models/](https://generativelanguage.googleapis.com/v1beta/models/){mod}:generateContent"
     try:
-      model = genai.GenerativeModel(
-          model_name=mod_name,
-          generation_config={"response_mime_type": "application/json"},
-          system_instruction=SYSTEM_PROMPT,
-      )
+      resp = requests.post(url, headers=headers, json=payload, timeout=60)
+      if resp.status_code == 200:
+        data = resp.json()
+        texto = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(texto)
+      else:
+        ultimo_error = f"Error {resp.status_code}: {resp.text}"
+    except Exception as e:
+      ultimo_error = str(e)
 
-      pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
-
-      response = model.generate_content([
-          pdf_part,
-          "Extrae los datos de esta factura para llenar el RPS.",
-      ])
-      return json.loads(response.text)
-    except Exception as err:
-      ultimo_error = err
-      time.sleep(1)
-      continue
-
-  raise ultimo_error
+  raise RuntimeError(ultimo_error)
 
 
 def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
@@ -136,7 +147,7 @@ if uploaded_pdf and api_key:
   if st.button("Procesar Factura y Generar RPS"):
     with st.spinner("Leyendo factura con Gemini y llenando formato..."):
       try:
-        datos = extraer_datos(uploaded_pdf.getvalue(), api_key)
+        datos = extraer_datos_rest(uploaded_pdf.getvalue(), api_key)
         excel_salida, folio, oc = llenar_plantilla(datos)
 
         st.success("¡RPS generado exitosamente!")
