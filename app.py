@@ -11,8 +11,8 @@ import fitz  # PyMuPDF
 import streamlit as st
 
 st.set_page_config(page_title="Generador RPS AAM", page_icon="📊", layout="centered")
-st.title("Generador Automático de RPS")
-st.write("Sube la Factura, la Orden de Compra y las fotos de evidencia para generar tu archivo Excel oficial.")
+st.title("Generador Automático de RPS con Auditoría")
+st.write("Sube la Factura, la Orden de Compra y las fotos de evidencia para auditar y generar tu archivo Excel.")
 
 api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
@@ -24,17 +24,19 @@ uploaded_oc = st.file_uploader("2. Orden de Compra en PDF (OC)", type=["pdf"])
 uploaded_fotos = st.file_uploader("3. Fotos de Evidencia ('DESPUÉS' - hasta 3 imágenes)", type=["png", "jpg", "jpeg"], accept_multiple_files=True)
 
 SYSTEM_PROMPT = """
-Eres un auditor contable corporativo. Se te proporciona el texto extraído de:
+Eres un auditor fiscal y contable corporativo estricto. Se te proporciona el texto extraído de:
 1. Factura emitida (CFDI).
 2. Orden de Compra oficial (OC).
 
-Tu tarea:
-1. Extraer los datos fiscales del CFDI y los generales de la OC para el formato RPS corporativo.
-2. Identificar la página específica de la Orden de Compra (número entero base 1) donde aparece la partida o tabla de partidas facturadas.
-3. Extraer todas las líneas facturadas. Si hay más de un concepto o partida, extraer cada uno en el arreglo 'lineas'. Para cada línea, identificar su número de línea en la OC y formatearlo estrictamente como 'X-1' (por ejemplo: '1-1', '2-1', '3-1').
+Tu misión principal es AUDITAR si la Factura corresponde auténticamente a la Orden de Compra subida, comprobando:
+- Que el número de Orden de Compra coincida.
+- Que el proveedor emisor de la factura corresponda al proveedor en la OC.
+- Que los conceptos/partidas facturados existan en la tabla de partidas de la OC.
 
-Devuelve EXCLUSIVAMENTE un objeto JSON con la siguiente estructura exacta:
+Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
 {
+  "documentos_coinciden": true/false,
+  "motivo_discrepancia": string (vacío si coinciden, o mensaje claro si hay error de discrepancia),
   "orden_compra": string,
   "nombre_proveedor": string,
   "folio_factura": string,
@@ -55,21 +57,22 @@ Devuelve EXCLUSIVAMENTE un objeto JSON con la siguiente estructura exacta:
 }
 
 Reglas estrictas:
-- 'pagina_oc_partida': número entero de la página del PDF de la OC donde está el renglón/partida facturada (ej. 4).
-- 'lineas.linea_po': código en formato 'X-1' correspondiente a esa partida en la OC.
-- 'lineas.descripcion': sólo el concepto del servicio, eliminando solicitante y número de OC/PO.
-- Devuelve únicamente el JSON válido sin bloques markdown ni texto adicional.
+- Si los documentos NO corresponden entre sí, marca 'documentos_coinciden': false y detalla claramente la discrepancia en 'motivo_discrepancia'.
+- Si corresponden, 'documentos_coinciden' debe ser true.
+- 'pagina_oc_partida': número de página (base 1) del PDF de la OC donde aparece el renglón facturado.
+- 'lineas.linea_po': código en formato 'X-1' en la OC.
+- 'lineas.descripcion': sólo el concepto del servicio, sin solicitante ni número de OC.
+- Devuelve únicamente el JSON válido.
 """
 
 def extraer_texto_pdf(pdf_bytes):
-    """Extrae el texto de cada página indicando su número para aligerar la petición a la IA."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     texto_total = []
     for num, page in enumerate(doc, 1):
         texto_total.append(f"--- PÁGINA {num} ---\n{page.get_text()}")
     return "\n".join(texto_total)
 
-def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
+def auditar_y_extraer(factura_bytes, oc_bytes, raw_key):
     clean_key = raw_key.strip().strip("'").strip('"')
     
     texto_fac = extraer_texto_pdf(factura_bytes)
@@ -77,9 +80,12 @@ def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
     
     if oc_bytes:
         texto_oc = extraer_texto_pdf(oc_bytes)
-        prompt_usuario += f"=== DOCUMENTO 2: ORDEN DE COMPRA (OC) ===\n{texto_oc}\n\nCruza las partidas y especifica en 'pagina_oc_partida' en qué número de página de la OC está el renglón facturado."
+        prompt_usuario += (
+            f"=== DOCUMENTO 2: ORDEN DE COMPRA (OC) ===\n{texto_oc}\n\n"
+            "Audita si la Factura ampara esta Orden de Compra y extrae los datos correspondientes."
+        )
     else:
-        prompt_usuario += "No se adjuntó OC. Extrae únicamente los datos de la factura."
+        prompt_usuario += "No se adjuntó OC. Extrae únicamente los datos de la factura con 'documentos_coinciden': true."
 
     payload = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -95,7 +101,6 @@ def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
         "x-goog-api-key": clean_key
     }
     
-    # Modelos oficiales válidos con cuota amplia
     modelos = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
@@ -113,15 +118,15 @@ def extraer_datos_con_oc(factura_bytes, oc_bytes, raw_key):
                     texto = data["candidates"][0]["content"]["parts"][0]["text"]
                     return json.loads(texto)
                 elif response.status_code in (429, 503):
-                    ultimo_error = f"Código {response.status_code}: Cuota saturada temporalmente en {mod}. Esperando..."
-                    time.sleep(4 * (intento + 1))
+                    ultimo_error = f"Código {response.status_code}: Esperando cupo de servicio ({mod})..."
+                    time.sleep(3 * (intento + 1))
                     continue
                 else:
                     ultimo_error = f"Código {response.status_code}: {response.text}"
                     break
             except Exception as e:
                 ultimo_error = str(e)
-                time.sleep(3)
+                time.sleep(2)
                 
     raise RuntimeError(ultimo_error)
 
@@ -211,7 +216,6 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         
     ws._images.clear()
 
-    # ANTES: Coordenadas y dimensiones calibradas
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
@@ -223,7 +227,6 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         except Exception:
             pass
             
-    # DESPUÉS: Coordenadas y dimensiones proporcionales
     celdas_despues = ["AD10", "AD17", "AD24"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
@@ -259,36 +262,42 @@ if "procesado" not in st.session_state:
     st.session_state.datos = None
 
 if uploaded_factura and api_key:
-    if st.button("Procesar Factura y Generar RPS"):
-        with st.spinner("Analizando documentos con IA y ensamblando RPS en Excel..."):
+    if st.button("Procesar y Auditar Documentos"):
+        with st.spinner("Auditando concordancia entre Factura y Orden de Compra..."):
             try:
                 oc_bytes = uploaded_oc.getvalue() if uploaded_oc else None
                 fotos_bytes = [f.getvalue() for f in uploaded_fotos] if uploaded_fotos else []
                 
-                datos = extraer_datos_con_oc(uploaded_factura.getvalue(), oc_bytes, api_key)
+                datos = auditar_y_extraer(uploaded_factura.getvalue(), oc_bytes, api_key)
                 
-                excel_salida = llenar_plantilla_excel(
-                    datos, 
-                    oc_bytes=oc_bytes,
-                    fotos_bytes=fotos_bytes
-                )
-                
-                folio = str(datos.get("folio_factura", "RPS"))
-                oc = str(datos.get("orden_compra", "OC"))
-                
-                st.session_state.procesado = True
-                st.session_state.excel_salida = excel_salida.getvalue()
-                st.session_state.nombre_base = f"RPS {oc} {folio}.xlsx"
-                st.session_state.datos = datos
-                
+                # VALIDACIÓN DEL AUDITOR
+                if not datos.get("documentos_coinciden", True):
+                    st.session_state.procesado = False
+                    motivo = datos.get("motivo_discrepancia", "Los documentos no corresponden entre sí.")
+                    st.error(f"❌ **ALERTA DE AUDITORÍA: DOCUMENTOS NO COINCIDEN**\n\n{motivo}")
+                else:
+                    excel_salida = llenar_plantilla_excel(
+                        datos, 
+                        oc_bytes=oc_bytes,
+                        fotos_bytes=fotos_bytes
+                    )
+                    
+                    folio = str(datos.get("folio_factura", "RPS"))
+                    oc = str(datos.get("orden_compra", "OC"))
+                    
+                    st.session_state.procesado = True
+                    st.session_state.excel_salida = excel_salida.getvalue()
+                    st.session_state.nombre_base = f"RPS {oc} {folio}.xlsx"
+                    st.session_state.datos = datos
+                    
             except Exception as e:
-                st.error(f"Error al procesar: {e}")
+                st.error(f"Error durante el proceso: {e}")
 
 if st.session_state.procesado:
     total_lineas = len(st.session_state.datos.get("lineas", []))
-    st.success(f"¡RPS generado exitosamente! ({total_lineas} partida(s) procesada(s))")
+    st.success(f"✅ **Auditoría aprobada:** Documentos validados correctamente ({total_lineas} partida(s) procesada(s)).")
     
-    with st.expander("Ver detalle de datos extraídos"):
+    with st.expander("Ver detalle auditado por la IA"):
         st.json(st.session_state.datos)
         
     st.download_button(
