@@ -2,8 +2,7 @@ import io
 import json
 import os
 import time
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 import openpyxl
 import streamlit as st
 
@@ -16,10 +15,9 @@ st.write(
     " logos y formato oficial."
 )
 
-# Lee la clave de los secretos de Streamlit o de variable de entorno
+# Obtener la API key de los Secrets de Streamlit
 api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
-# Si no está configurada en secretos (por si pruebas en local), muestra el campo
 if not api_key:
   api_key = st.text_input("Ingresa tu Gemini API Key:", type="password")
 
@@ -51,40 +49,35 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido con la siguiente estructura:
 Reglas estrictas:
 - En 'orden_compra' coloca solo números o el código limpio (ej. si dice 'OC 786794', extrae '786794').
 - En 'solicitante', revisa tanto los campos de adenda como el texto dentro de la descripción del concepto.
-- Devuelve únicamente el JSON sin comentarios ni bloques adicionales.
+- Devuelve únicamente el JSON sin comentarios adicionales.
 """
 
 
 def extraer_datos(pdf_bytes, key):
-  client = genai.Client(api_key=key)
-  modelos = ["gemini-3.6-flash", "gemini-3.1-pro-preview"]
+  genai.configure(api_key=key)
+
+  modelos = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
   ultimo_error = None
 
-  for modelo in modelos:
-    for intento in range(2):
-      try:
-        response = client.models.generate_content(
-            model=modelo,
-            contents=[
-                types.Part.from_bytes(
-                    data=pdf_bytes, mime_type="application/pdf"
-                ),
-                "Extrae los datos de esta factura para llenar el RPS.",
-            ],
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
-        return json.loads(response.text)
-      except Exception as err:
-        ultimo_error = err
-        err_str = str(err).lower()
-        if "503" in err_str or "404" in err_str or "not_found" in err_str:
-          time.sleep(1.5)
-          continue
-        break
+  for mod_name in modelos:
+    try:
+      model = genai.GenerativeModel(
+          model_name=mod_name,
+          generation_config={"response_mime_type": "application/json"},
+          system_instruction=SYSTEM_PROMPT,
+      )
+
+      pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
+
+      response = model.generate_content([
+          pdf_part,
+          "Extrae los datos de esta factura para llenar el RPS.",
+      ])
+      return json.loads(response.text)
+    except Exception as err:
+      ultimo_error = err
+      time.sleep(1)
+      continue
 
   raise ultimo_error
 
@@ -96,18 +89,23 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
   folio = str(datos.get("folio_factura", "RPS"))
   ws.title = folio
 
+  # 1. Orden de Compra (Fila 7, Columna E)
   if datos.get("orden_compra"):
     oc = datos["orden_compra"]
     ws.cell(
         row=7, column=5, value=int(oc) if str(oc).isdigit() else str(oc)
     )
 
+  # 2. Proveedor (Fila 9, Columna E)
   ws.cell(row=9, column=5, value=datos.get("nombre_proveedor", ""))
+
+  # 3. Folio Factura (Fila 11, Columna E) y Tipo de Servicio (Fila 11, Columna J)
   ws.cell(
       row=11, column=5, value=int(folio) if folio.isdigit() else str(folio)
   )
   ws.cell(row=11, column=10, value=datos.get("tipo_servicio", "Entrenamiento"))
 
+  # 4. Detalle de Concepto (Fila 15)
   lineas = datos.get("lineas", [])
   if lineas:
     l = lineas[0]
@@ -119,10 +117,12 @@ def llenar_plantilla(datos, plantilla_path="plantilla_RPS.xlsx"):
     ws.cell(row=15, column=7, value=l.get("descripcion", ""))
     ws.cell(row=15, column=16, value="YES")
 
+  # 5. Monto Total a Recibir (Fila 25, Columnas E y F)
   subtotal = datos.get("subtotal", 0)
   ws.cell(row=25, column=5, value=subtotal)
   ws.cell(row=25, column=6, value=subtotal)
 
+  # 6. Solicitante (Fila 27, Columna C)
   if datos.get("solicitante"):
     ws.cell(row=27, column=3, value=datos["solicitante"])
 
