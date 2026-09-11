@@ -4,8 +4,6 @@ import re
 import json
 import time
 import base64
-import subprocess
-import tempfile
 import requests
 import openpyxl
 from openpyxl.drawing.image import Image as OpenpyxlImage
@@ -13,9 +11,9 @@ from PIL import Image as PILImage
 import fitz  # PyMuPDF
 import streamlit as st
 
-st.set_page_config(page_title="Generador RPS AAM", page_icon="📄", layout="centered")
-st.title("Generador Automático de RPS con Evidencias")
-st.write("Sube la Factura, la Orden de Compra y las fotos de evidencia para generar tu Excel y PDF oficiales.")
+st.set_page_config(page_title="Generador RPS AAM", page_icon="📊", layout="centered")
+st.title("Generador Automático de RPS")
+st.write("Sube la Factura, la Orden de Compra y las fotos de evidencia para generar tu archivo Excel oficial.")
 
 api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
 
@@ -172,13 +170,18 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
     solicitante_val = datos.get("solicitante", "")
     ws.title = folio
     
+    # 1. Orden de Compra (Fila 7, Columna E)
     if oc_val:
         ws.cell(row=7, column=5, value=int(oc_val) if str(oc_val).isdigit() else str(oc_val))
     
+    # 2. Proveedor (Fila 9, Columna E)
     ws.cell(row=9, column=5, value=datos.get("nombre_proveedor", ""))
+    
+    # 3. Folio Factura y Tipo de Servicio (Fila 11)
     ws.cell(row=11, column=5, value=int(folio) if folio.isdigit() else str(folio))
     ws.cell(row=11, column=10, value=datos.get("tipo_servicio", "Entrenamiento"))
     
+    # 4. Detalle de partidas/conceptos
     lineas = datos.get("lineas", [])
     fila_inicio = 15
     for idx, l in enumerate(lineas):
@@ -202,16 +205,19 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         ws.cell(row=r, column=7, value=desc_limpia)
         ws.cell(row=r, column=16, value="YES")
         
+    # 5. Monto Total (Fila 25)
     subtotal = datos.get("subtotal", 0)
     ws.cell(row=25, column=5, value=subtotal)
     ws.cell(row=25, column=6, value=subtotal)
     
+    # 6. Solicitante (Fila 27)
     if solicitante_val:
         ws.cell(row=27, column=3, value=solicitante_val)
         
+    # Limpiar imágenes previas para no encimar
     ws._images.clear()
 
-    # 1. ANTES: Cuadrado en T10 (430px x 570px)
+    # 7. ANTES: Cuadrado perfecto en T10 (430px x 570px)
     if oc_bytes:
         try:
             pag_oc = datos.get("pagina_oc_partida")
@@ -223,7 +229,7 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
         except Exception:
             pass
             
-    # 2. DESPUÉS: Cuadrado en AD10, AD17, AD24
+    # 8. DESPUÉS: Centradas en AD10, AD17, AD24 con proporciones originales
     celdas_despues = ["AD10", "AD17", "AD24"]
     for i, f_bytes in enumerate(fotos_bytes[:3]):
         try:
@@ -245,81 +251,40 @@ def llenar_plantilla_excel(datos, oc_bytes=None, fotos_bytes=[], plantilla_path=
             ws.add_image(excel_img, celdas_despues[i])
         except Exception:
             pass
-            
-    # Asegurar orientación horizontal (landscape) para impresión
-    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
-    ws.page_setup.paperSize = ws.PAPERSIZE_LETTER
-    
+        
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return output
 
-def convertir_excel_a_pdf(excel_bytes):
-    """Convierte el archivo Excel directamente a PDF usando LibreOffice headless (idéntico a imprimir desde Excel)"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_xlsx = os.path.join(tmpdir, "documento.xlsx")
-        with open(input_xlsx, "wb") as f:
-            f.write(excel_bytes)
-            
-        cmd = [
-            "libreoffice",
-            "--headless",
-            "--convert-to",
-            "pdf",
-            "--outdir",
-            tmpdir,
-            input_xlsx
-        ]
-        
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        output_pdf = os.path.join(tmpdir, "documento.pdf")
-        
-        if os.path.exists(output_pdf):
-            with open(output_pdf, "rb") as f:
-                return f.read()
-        else:
-            raise RuntimeError(f"Error en LibreOffice: {result.stderr.decode('utf-8')}")
-
 # ----------------- GESTIÓN DE SESIÓN PERSISTENTE -----------------
 if "procesado" not in st.session_state:
     st.session_state.procesado = False
     st.session_state.excel_salida = None
-    st.session_state.pdf_salida = None
     st.session_state.nombre_base = ""
     st.session_state.datos = None
 
 if uploaded_factura and api_key:
-    if st.button("Procesar y Generar Documentos"):
-        with st.spinner("Analizando documentos con IA y ensamblando archivos..."):
+    if st.button("Procesar Factura y Generar RPS"):
+        with st.spinner("Analizando documentos y ensamblando RPS en Excel..."):
             try:
                 oc_bytes = uploaded_oc.getvalue() if uploaded_oc else None
                 fotos_bytes = [f.getvalue() for f in uploaded_fotos] if uploaded_fotos else []
                 
                 datos = extraer_datos_con_oc(uploaded_factura.getvalue(), oc_bytes, api_key)
                 
-                # 1. Generar Excel (con las posiciones exactas y en apaisado)
                 excel_salida = llenar_plantilla_excel(
                     datos, 
                     oc_bytes=oc_bytes,
                     fotos_bytes=fotos_bytes
                 )
-                excel_bytes = excel_salida.getvalue()
-                
-                # 2. Convertir el propio Excel a PDF directamente
-                try:
-                    pdf_bytes = convertir_excel_a_pdf(excel_bytes)
-                except Exception as ex:
-                    pdf_bytes = None
-                    st.warning(f"No se pudo compilar el PDF con LibreOffice: {ex}")
                 
                 folio = str(datos.get("folio_factura", "RPS"))
                 oc = str(datos.get("orden_compra", "OC"))
                 
                 st.session_state.procesado = True
-                st.session_state.excel_salida = excel_bytes
-                st.session_state.pdf_salida = pdf_bytes
-                st.session_state.nombre_base = f"RPS {oc} {folio}"
+                st.session_state.excel_salida = excel_salida.getvalue()
+                st.session_state.nombre_base = f"RPS {oc} {folio}.xlsx"
                 st.session_state.datos = datos
                 
             except Exception as e:
@@ -327,28 +292,15 @@ if uploaded_factura and api_key:
 
 if st.session_state.procesado:
     total_lineas = len(st.session_state.datos.get("lineas", []))
-    st.success(f"¡Documentos listos! ({total_lineas} partida(s) procesada(s))")
+    st.success(f"¡RPS generado exitosamente! ({total_lineas} partida(s) procesada(s))")
     
     with st.expander("Ver detalle de datos extraídos"):
         st.json(st.session_state.datos)
         
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            label=f"📊 Descargar {st.session_state.nombre_base}.xlsx",
-            data=st.session_state.excel_salida,
-            file_name=f"{st.session_state.nombre_base}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="btn_dl_excel"
-        )
-    with col2:
-        if st.session_state.pdf_salida:
-            st.download_button(
-                label=f"📄 Descargar {st.session_state.nombre_base}.pdf",
-                data=st.session_state.pdf_salida,
-                file_name=f"{st.session_state.nombre_base}.pdf",
-                mime="application/pdf",
-                key="btn_dl_pdf"
-            )
-        else:
-            st.info("El PDF requiere reiniciar el contenedor de Streamlit con 'packages.txt'.")
+    st.download_button(
+        label=f"📥 Descargar {st.session_state.nombre_base}",
+        data=st.session_state.excel_salida,
+        file_name=st.session_state.nombre_base,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="btn_dl_excel"
+    )
