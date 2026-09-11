@@ -53,9 +53,7 @@ Reglas estrictas:
 
 
 def extraer_datos(pdf_bytes, raw_key):
-  # Limpieza estricta de la clave para evitar caracteres invisibles
   clean_key = raw_key.strip().strip("'").strip('"')
-
   pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
   payload = {
@@ -77,10 +75,10 @@ def extraer_datos(pdf_bytes, raw_key):
       "x-goog-api-key": clean_key,
   }
 
-  # Modelos compatibles
+  # Modelos activos recomendados por la API
   modelos = [
-      "gemini-2.5-flash",
-      "gemini-2.0-flash",
+      "gemini-3.6-flash",
+      "gemini-3.1-pro-preview",
   ]
   ultimo_error = None
 
