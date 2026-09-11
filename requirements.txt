@@ -1,5 +1,5 @@
 streamlit
-requests
 openpyxl
 pymupdf
 pillow
+google-genai
